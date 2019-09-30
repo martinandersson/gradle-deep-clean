@@ -1,0 +1,629 @@
+#!/usr/bin/env -S java '--source 11'
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.text.NumberFormat;
+import java.time.LocalDateTime;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.EnumMap;
+import java.util.HashMap;
+import java.util.LongSummaryStatistics;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Queue;
+import java.util.Set;
+import java.util.StringJoiner;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ForkJoinPool;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Collector;
+import java.util.stream.Stream;
+
+import static java.lang.System.lineSeparator;
+import static java.nio.file.LinkOption.NOFOLLOW_LINKS;
+import static java.text.MessageFormat.format;
+import static java.time.format.DateTimeFormatter.ofPattern;
+import static java.util.Arrays.stream;
+import static java.util.Collections.unmodifiableMap;
+import static java.util.stream.Collectors.joining;
+import static java.util.stream.Collectors.partitioningBy;
+import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toSet;
+import static java.util.stream.Stream.concat;
+
+class Script
+{
+    public static void main(String... args) {
+        final Path root = getDirectoryToSearch(args);
+        
+        Map<Boolean, Summary> summaries = new Search(root).matches()
+                .map(GradleCleanProcess::new)
+                .map(GradleCleanProcess::start)
+                .collect(partitioningBy(ProcessResult::wasSuccessful, Summary.COLLECTOR));
+        
+        Summary successful = summaries.get(true);
+        
+        ConsoleLine.INSTANCE.println(Colored.green(format(
+                "Ran {0} successful clean task(s) which deleted {1} file(s) and saved {2}.",
+                successful.count(), successful.filesDeleted(), successful.diskSpaceSaved())));
+        
+        Summary fails = summaries.get(false);
+        
+        if (!fails.isEmpty()) {
+            Path log = writeOutputLog(fails);
+            
+            ConsoleLine.INSTANCE.println(Colored.red(
+                    fails.count() + " clean task(s) was not successful :'("));
+            
+            ConsoleLine.INSTANCE.println(Colored.red("For details, see: ") + log);
+        }
+    }
+    
+    private static Path getDirectoryToSearch(String... args) {
+        final Path root;
+        
+        try {
+            root = Paths.get(Option.withEffectiveValues(args).get(Option.DIR));
+        }
+        catch (IllegalArgumentException e) {
+            System.out.println(Colored.red(e.getMessage()));
+            System.exit(1);
+            return null; // dead code
+        }
+        
+        if (!Files.isDirectory(root)) {
+            System.out.println(Colored.red(
+                    "\"" + root + "\" does not exist or is not a directory."));
+            System.exit(1);
+            return null; // dead code
+        }
+        
+        return root;
+    }
+    
+    private static Path writeOutputLog(Summary summary) {
+        Stream<String> entries = summary.observations().map(r -> new StringJoiner(lineSeparator())
+                .add(r.getProcess().toString())
+                .add("---------START---------")
+                .add(r.output())
+                .add("----------END----------")
+                .toString());
+        
+        return IOExceptions.uncheckedGet(() ->
+                Files.write(tempFilePath(), entries.collect(toList())));
+    }
+    
+    private static Path tempFilePath() {
+        String dateTime = LocalDateTime.now().format(ofPattern("yyyyMMdd'T'HHmmss"));
+        
+        return Paths.get(System.getProperty("java.io.tmpdir"),
+                "gdc-err-" + dateTime + ".log");
+    }
+}
+
+enum Option
+{
+    DIR(() -> Paths.get("").toAbsolutePath().toString(), "-d", "--dir");
+    
+    static Map<Option, String> withEffectiveValues(String... args) {
+        final var optionToValue = parseUserValues(args);
+        
+        // Load defaults for all options not provided by user
+        stream(values()).forEach(opt ->
+                optionToValue.computeIfAbsent(opt, key -> opt.defaultValue.get()));
+        
+        return unmodifiableMap(optionToValue);
+    }
+    
+    private static Map<Option, String> parseUserValues(String... args) {
+        final var optionToValue = new EnumMap<Option, String>(Option.class);
+        
+        Option last = null;
+        StringBuilder value = null;
+        
+        for (String word : args) {
+            if (word.startsWith("-")) {
+                last = ALIAS_TO_OPTION.get(word);
+                
+                if (last == null) {
+                    throw new IllegalArgumentException("Unknown flag: " + word);
+                }
+                
+                value = new StringBuilder();
+            }
+            else if (last == null) {
+                throw new IllegalArgumentException("Please prefix options with '-' or '--'.");
+            }
+            else {
+                value.append(" " + word);
+                optionToValue.put(last, value.toString().strip());
+            }
+        }
+        
+        return optionToValue;
+    }
+    
+    private static final Map<String, Option> ALIAS_TO_OPTION;
+    
+    static {
+        final var aliasToOption = new HashMap<String, Option>();
+    
+        stream(values()).forEach(opt -> opt.aliases.forEach(
+                alias -> aliasToOption.put(alias, opt)));
+        
+        ALIAS_TO_OPTION = unmodifiableMap(aliasToOption);
+    }
+    
+    private final Set<String> aliases;
+    
+    private final Supplier<String> defaultValue;
+    
+    private Option(Supplier<String> defaultValue, String name, String... more) {
+        this.defaultValue = defaultValue;
+        this.aliases = concat(Stream.of(name), stream(more)).collect(toSet());
+    }
+}
+
+/**
+ * Use {@code print()} to overwrite the current line of text on {@code
+ * System.out} and {@code println()} to begin a new line.
+ */
+enum ConsoleLine
+{
+    INSTANCE;
+    
+    private int lineWidth;
+    
+    void print(String message) {
+        System.out.print(convert(message));
+        System.out.flush();
+    }
+    
+    void println(String message) {
+        print(message);
+        println();
+    }
+    
+    private String convert(String message) {
+        if (message == null) {
+            message = "null";
+        }
+        
+        if (message.length() > lineWidth) {
+            lineWidth = message.length();
+        }
+        else {
+            message += " ".repeat(lineWidth - message.length());
+        }
+        
+        return "\r" + message;
+    }
+    
+    private void println() {
+        System.out.println();
+        lineWidth = 0;
+    }
+}
+
+class Search
+{
+    // Stack of directories to search, on a depth-first basis
+    private final Deque<Path> directories;
+    
+    Search(Path directory) {
+        directories = new ArrayDeque<>();
+        directories.add(directory);
+    }
+    
+    Stream<Path> matches() {
+        return Stream.generate(this::nextMatch)
+                .takeWhile(Objects::nonNull);
+    }
+    
+    private Path nextMatch() {
+        Path dir;
+        
+        while ((dir = nextDir()) != null) {
+            ConsoleLine.INSTANCE.print(Colored.cyan("Searching: " + dir));
+            
+            final SearchResult r;
+            
+            try {
+                r = search(dir);
+            }
+            catch (UncheckedIOException e) {
+                if (e.getCause() instanceof AccessDeniedException) {
+                    ConsoleLine.INSTANCE.println(Colored.red(
+                            "Access denied; will skip: ") + dir);
+                    
+                    continue;
+                }
+                else {
+                    throw e;
+                }
+            }
+            
+            if (r.match().isPresent()) {
+                return r.match().get();
+            }
+            else {
+                r.subdirectories().forEach(directories::addFirst);
+            }
+        }
+        
+        return null;
+    }
+    
+    private Path nextDir() {
+        Path d = directories.pollLast();
+        return d == null || !skip(d) ? d : nextDir();
+    }
+    
+    private static boolean skip(Path dir) {
+        final Path filename = dir.getFileName();
+        
+        if (filename == null) { // root
+            return false;
+        }
+        
+        return filename.toString().equals("node_modules") ||
+               IOExceptions.uncheckedGet(() -> Files.isHidden(dir));
+    }
+    
+    private static SearchResult search(Path dir) {
+        final SearchResult.Builder b = new SearchResult.Builder();
+        
+        IOExceptions.uncheckedTryWith(() -> Files.newDirectoryStream(dir), stream -> {
+            for (Path p : stream) {
+                if (Files.isDirectory(p, NOFOLLOW_LINKS)) {
+                    if (!b.hasMatch()) {
+                        // Enqueue this directory as a possible path for a new search
+                        b.addSubDir(p);
+                    }
+                    
+                    continue;
+                }
+                
+                // Okay no directory, investigate file
+                String file = p.getFileName().toString();
+                
+                if (file.equals("gradlew")) {
+                    b.setMatch(p);
+                    // Job done
+                    break;
+                }
+                else if (file.equals("build.gradle")) {
+                    b.setMatch(p);
+                    // ..no break; the hunt continues (prioritize gradlew)
+                }
+            }
+        });
+        
+        return b.build();
+    }
+}
+
+interface SearchResult
+{
+    Optional<Path> match();
+    
+    Stream<Path> subdirectories();
+    
+    final class Builder
+    {
+        private Path match;
+        
+        private Stream.Builder<Path> subdirs;
+        
+        void setMatch(Path match) {
+            this.match = match;
+        }
+        
+        boolean hasMatch() {
+            return match != null;
+        }
+        
+        void addSubDir(Path subdir) {
+            if (subdirs == null) {
+                subdirs = Stream.builder();
+            }
+            
+            subdirs.add(subdir);
+        }
+        
+        SearchResult build() {
+            return new SearchResult() {
+                @Override public Optional<Path> match() {
+                    return Optional.ofNullable(match);
+                }
+                
+                @Override public Stream<Path> subdirectories() {
+                    return subdirs == null ? Stream.empty() : subdirs.build();
+                }
+            };
+        }
+    }
+}
+
+class GradleCleanProcess
+{
+    private static final boolean WINDOWS
+            = System.getProperty("os.name").toLowerCase().contains("windows");
+    
+    private final Path workingDir;
+    
+    private final String command;
+    
+    GradleCleanProcess(Path match) {
+        workingDir = match.getParent();
+        this.command = transform(match);
+    }
+    
+    private static String transform(Path match) {
+        final String file = match.getFileName().toString();
+        
+        if (file.equals("gradlew")) {
+            return WINDOWS ? file + ".bat" : "./" + file;
+        }
+        
+        return "gradle";
+    }
+    
+    ProcessResult start() {
+        ProcessBuilder pb = new ProcessBuilder(command, "clean")
+                .directory(workingDir.toFile())
+                .redirectErrorStream(true);
+        
+        DirectorySnapshot beforeStart = DirectorySnapshot.make(workingDir);
+        
+        ConsoleLine.INSTANCE.println(Colored.green("Executing: " + this));
+        
+        Process p = IOExceptions.uncheckedGet(pb::start);
+        Output out = Output.connect(p, System.out::println);
+        
+        return new ProcessResult(this, beforeStart, p, out);
+    }
+    
+    Path getWorkingDir() {
+        return workingDir;
+    }
+    
+    @Override
+    public String toString() {
+        return "\"" + workingDir + "\" -> " + command + " clean";
+    }
+}
+
+class DirectorySnapshot
+{
+    static DirectorySnapshot make(Path directory) {
+        LongSummaryStatistics stats = IOExceptions.uncheckedTryWithGet(() ->
+                Files.walk(directory), stream -> stream
+                .filter((p -> Files.isRegularFile(p, NOFOLLOW_LINKS)))
+                .mapToLong(p -> IOExceptions.uncheckedGet(() -> Files.size(p)))
+                .summaryStatistics());
+        
+        return new DirectorySnapshot(stats.getCount(), stats.getSum());
+    }
+    
+    private final long fileCount, directorySize;
+    
+    private DirectorySnapshot(long fileCount, long directorySize) {
+        this.fileCount = fileCount;
+        this.directorySize = directorySize;
+    }
+    
+    long fileCount() {
+        return fileCount;
+    }
+    
+    long directorySize() {
+        return directorySize;
+    }
+}
+
+@FunctionalInterface
+interface Output {
+    Stream<String> lines();
+    
+    @SafeVarargs
+    static Output connect(Process to, Consumer<String>... observers) {
+        final Queue<String> lines = new ConcurrentLinkedQueue<>();
+        
+        ForkJoinPool.commonPool().submit(() ->
+                IOExceptions.uncheckedTryWith(to::getInputStream, in ->
+                        new BufferedReader(new InputStreamReader(in)).lines().forEach(l -> {
+                            lines.add(l);
+                            stream(observers).forEach(o -> o.accept(l));
+                        })));
+        
+        return lines::stream;
+    }
+}
+
+class ProcessResult
+{
+    private final GradleCleanProcess gcp;
+    
+    private final Process proc;
+    
+    private final DirectorySnapshot preRun;
+    
+    private final CompletableFuture<DirectorySnapshot> postRun;
+    
+    private final Output output;
+    
+    ProcessResult(GradleCleanProcess gcp,
+            DirectorySnapshot beforeStart, Process process, Output output)
+    {
+        this.gcp     = gcp;
+        this.proc    = process;
+        this.preRun  = beforeStart;
+        this.postRun = process.onExit().thenApply(unusedProcess ->
+                DirectorySnapshot.make(gcp.getWorkingDir()));
+        this.output  = output;
+    }
+    
+    boolean wasSuccessful() {
+        return exitValue() == 0;
+    }
+    
+    DirectorySnapshot dirSnapPreRun() {
+        return preRun;
+    }
+    
+    DirectorySnapshot dirSnapPostRun() {
+        return postRun.join();
+    }
+    
+    GradleCleanProcess getProcess() {
+        return gcp;
+    }
+    
+    private int exitValue() {
+        if (proc.isAlive()) {
+            postRun.join();
+        }
+        
+        return proc.exitValue();
+    }
+    
+    String output() {
+        return output.lines().collect(joining(lineSeparator()));
+    }
+}
+
+class Summary
+{
+    static final Collector<ProcessResult, Summary, Summary> COLLECTOR
+            = Collector.of(Summary::new, Summary::add, Summary::combine);
+    
+    private Queue<ProcessResult> observations;
+    
+    private long filesDeleted,
+                 diskSpaceSaved;
+    
+    private Summary() {
+        // Empty
+    }
+    
+    boolean isEmpty() {
+        return observations == null;
+    }
+    
+    int count() {
+        return isEmpty() ? 0 : observations.size();
+    }
+    
+    long filesDeleted() {
+        return filesDeleted;
+    }
+    
+    String diskSpaceSaved() {
+        return humanReadableBytes(diskSpaceSaved);
+    }
+    
+    Stream<ProcessResult> observations() {
+        return observations.stream();
+    }
+    
+    private void add(ProcessResult result) {
+        if (observations == null) {
+            observations = new ArrayDeque<>();
+        }
+        
+        final DirectorySnapshot pre = result.dirSnapPreRun(),
+                               post = result.dirSnapPostRun();
+        
+        long newFilesDeleted = Math.addExact(filesDeleted,
+                pre.fileCount() - post.fileCount());
+        
+        long newDiskSpaceSaved = Math.addExact(diskSpaceSaved,
+                pre.directorySize() - post.directorySize());
+        
+        filesDeleted = newFilesDeleted;
+        diskSpaceSaved = newDiskSpaceSaved;
+        observations.add(result);
+    }
+    
+    private Summary combine(Summary summary) {
+        throw new UnsupportedOperationException("Implement me.");
+    }
+    
+    private static String humanReadableBytes(long bytes) {
+        NumberFormat nf = NumberFormat.getInstance();
+        nf.setMaximumFractionDigits(2);
+        
+        final int BYTES_PER_MB = 1_048_576;
+        double mb = bytes / (double) BYTES_PER_MB;
+        
+        return nf.format(mb) + " MB (" + nf.format(bytes) + " bytes)";
+    }
+}
+
+enum Colored {;
+    private static String RESET = "\033[0m";
+    
+    static String red(String text) {
+        return "\033[1;31m" + text + RESET;
+    }
+    
+    static String green(String text) {
+        return "\033[1;32m" + text + RESET;
+    }
+    
+    static String cyan(String text) {
+        return "\033[1;36m" + text + RESET;
+    }
+}
+
+enum IOExceptions
+{;
+    @FunctionalInterface
+    interface IOSupplier<T> {
+        T get() throws IOException;
+    }
+    
+    static <T extends AutoCloseable> void uncheckedTryWith(
+            IOSupplier<T> resource, Consumer<? super T> block)
+    {
+        uncheckedTryWithGet(resource, t -> {
+            block.accept(t);
+            return null;
+        });
+    }
+    
+    static <T extends AutoCloseable, R> R uncheckedTryWithGet(
+            IOSupplier<T> resource, Function<? super T, R> block)
+    {
+        try (T t = resource.get()) {
+            return block.apply(t);
+        }
+        catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+    
+    static <T> T uncheckedGet(IOSupplier<T> supplier) {
+        try {
+            return supplier.get();
+        }
+        catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+}
