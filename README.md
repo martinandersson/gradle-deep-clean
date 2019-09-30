@@ -1,2 +1,1 @@
-# gradle-deep-clean
-A Java script to recursively clean Gradle projects
+A proper README file is on it's way. Stay tuned.
