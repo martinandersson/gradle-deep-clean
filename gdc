@@ -130,7 +130,6 @@ enum Option
         final var optionToValue = new EnumMap<Option, String>(Option.class);
         
         Option last = null;
-        StringBuilder value = null;
         
         for (String word : args) {
             if (word.startsWith("-")) {
@@ -140,15 +139,15 @@ enum Option
                     throw new IllegalArgumentException("Unknown flag: " + word);
                 }
                 
-                value = new StringBuilder();
+                continue;
             }
-            else if (last == null) {
+            
+            if (last == null) {
                 throw new IllegalArgumentException("Please prefix options with '-' or '--'.");
             }
-            else {
-                value.append(" " + word);
-                optionToValue.put(last, value.toString().strip());
-            }
+            
+            optionToValue.compute(last, (k, v) ->
+                    v == null ? word : v + " " + word);
         }
         
         return optionToValue;
